@@ -1,0 +1,6 @@
+{
+  "channel_id": "あなたのFC2チャンネルID（数字）",
+  "token": "FC2コメントAPIトークン",
+  "serviceId": "",
+  "intervalMs": 2500
+}

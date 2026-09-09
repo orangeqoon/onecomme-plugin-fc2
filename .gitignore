@@ -1,0 +1,9 @@
+# 秘密情報の除外
+config.json
+
+# OS・エディタ関連
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
