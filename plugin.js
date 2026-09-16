@@ -7,6 +7,16 @@ let isInitialized = false;
 let lastCommentIndex = -1;
 let lastErrorStatus = null;
 let resolvedServiceId = null;
+let currentDir = __dirname;
+
+// ステータス管理
+let statusState = {
+  status: 'idle', // idle, connecting, active, error, auth_error
+  message: '待機中',
+  lastCommentTime: null,
+  totalReceived: 0,
+  channelId: ''
+};
 
 // 匿名ユーザー用通し番号テーブル
 const anonymousMap = new Map();
@@ -142,135 +152,243 @@ async function sendCommentsToOnecomme(comments, serviceId) {
     }).catch(err => {
       console.error('[fc2-plugin] わんコメへのコメント送信エラー:', err.message);
     });
+
+    statusState.totalReceived++;
+    statusState.lastCommentTime = Date.now();
   }
+}
+
+async function fetchFC2Comments(channelId, token, serviceId) {
+  const url = `https://live.fc2.com/api/getChannelComment.php?channel_id=${encodeURIComponent(channelId)}&token=${encodeURIComponent(token)}&last_comment_index=${lastCommentIndex}`;
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    statusState.status = 'error';
+    statusState.message = `HTTPエラー: ${res.status}`;
+    throw new Error(`HTTPエラー: ${res.status}`);
+  }
+
+  const data = await res.json();
+
+  if (data.status !== 0) {
+    if (data.status !== lastErrorStatus) {
+      lastErrorStatus = data.status;
+      if (data.status === 11) {
+        statusState.status = 'auth_error';
+        statusState.message = '認証エラー (Token無効 または 配信枠未開始)';
+        console.warn(`[fc2-plugin] FC2 API ステータス 11: 認証エラー、または配信が開始されていない可能性があります。(channel_id: ${channelId})`);
+      } else {
+        statusState.status = 'error';
+        statusState.message = `FC2エラー: Status ${data.status}`;
+        console.warn(`[fc2-plugin] FC2 API エラーステータス: ${data.status}`);
+      }
+    }
+    return;
+  }
+
+  statusState.status = 'active';
+  statusState.message = '受信中（正常稼働）';
+
+  if (lastErrorStatus !== null) {
+    console.info('[fc2-plugin] FC2 APIへの接続が正常になりました。');
+    lastErrorStatus = null;
+  }
+
+  // 初回接続時: 直近15分以内のコメントを取り込む
+  if (!isInitialized) {
+    lastCommentIndex = typeof data.last_comment_index === 'number' ? data.last_comment_index : -1;
+    isInitialized = true;
+
+    const now = Date.now();
+    const recentThreshold = now - (15 * 60 * 1000);
+    const allComments = Array.isArray(data.comments) ? data.comments : [];
+    const recentComments = allComments.filter(c => c.timestamp && Number(c.timestamp) >= recentThreshold);
+
+    if (recentComments.length > 0) {
+      console.info(`[fc2-plugin] 初回接続成功！直近15分以内のコメント ${recentComments.length} 件を取り込みます (最新Index: ${lastCommentIndex})`);
+      await sendCommentsToOnecomme(recentComments, serviceId);
+    } else {
+      console.info(`[fc2-plugin] 初回接続成功！最新コメントIndex: ${lastCommentIndex} (過去コメント ${allComments.length} 件をスキップして新着待機)`);
+    }
+    return;
+  }
+
+  // 2回目以降の新着コメント処理
+  if (typeof data.last_comment_index === 'number' && data.last_comment_index > lastCommentIndex) {
+    lastCommentIndex = data.last_comment_index;
+  }
+
+  if (Array.isArray(data.comments) && data.comments.length > 0) {
+    await sendCommentsToOnecomme(data.comments, serviceId);
+  }
+}
+
+function startPolling(dir) {
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+  isPolling = false;
+  resetState();
+
+  const configPath = path.join(dir, 'config.json');
+  if (!fs.existsSync(configPath)) {
+    statusState.status = 'idle';
+    statusState.message = '設定未完了 (config.json なし)';
+    return;
+  }
+
+  let config;
+  try {
+    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch (e) {
+    statusState.status = 'error';
+    statusState.message = 'config.json パースエラー';
+    return;
+  }
+
+  const { channel_id, token, serviceId: configuredServiceId } = config;
+  statusState.channelId = channel_id || '';
+
+  if (!channel_id || !token || channel_id.includes('ここに') || token.includes('ここに')) {
+    statusState.status = 'idle';
+    statusState.message = '設定未完了（IDまたはトークンが未入力）';
+    return;
+  }
+
+  statusState.status = 'connecting';
+  statusState.message = '接続確認中...';
+
+  const poll = async () => {
+    if (isPolling) return;
+    isPolling = true;
+
+    try {
+      if (!fs.existsSync(configPath)) return;
+      const conf = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      const cid = conf.channel_id;
+      const tok = conf.token;
+      const sId = await resolveServiceId(conf.serviceId);
+
+      if (!cid || !tok || cid.includes('ここに') || tok.includes('ここに')) {
+        return;
+      }
+
+      if (!sId) {
+        statusState.status = 'error';
+        statusState.message = 'わんコメ枠が見つかりません';
+        console.warn('[fc2-plugin] わんコメにFC2用の配信枠が見つかりません。');
+        return;
+      }
+
+      await fetchFC2Comments(cid, tok, sId);
+    } catch (err) {
+      console.error('[fc2-plugin] ポーリングエラー:', err.message || err);
+    } finally {
+      isPolling = false;
+    }
+  };
+
+  let intervalMs = 2500;
+  if (config.intervalMs && config.intervalMs >= 1000) {
+    intervalMs = config.intervalMs;
+  }
+
+  timer = setInterval(poll, intervalMs);
+  poll(); // 初回即時実行
+  console.info(`[fc2-plugin] 監視ループを開始しました (${intervalMs}ms 間隔)`);
 }
 
 const plugin = {
   name: 'FC2ライブ コメント連携',
   uid: 'com.fc2live.comment-sync',
-  version: '1.3.0',
+  version: '1.4.0',
   author: 'orangeqoon',
   url: 'https://github.com/orangeqoon/onecomme-plugin-fc2',
   permissions: ['comments'],
   defaultState: {},
 
   init({ dir }) {
-    console.info('[fc2-plugin] 初期化開始 (FC2ライブ コメント連携 v1.3.0)');
+    currentDir = dir;
+    console.info('[fc2-plugin] 初期化開始 (FC2ライブ コメント連携 v1.4.0)');
     const configPath = path.join(dir, 'config.json');
     const sampleConfigPath = path.join(dir, 'config.sample.json');
 
-    // config.json が無い場合は雛形を自動作成
     if (!fs.existsSync(configPath)) {
       if (fs.existsSync(sampleConfigPath)) {
         fs.copyFileSync(sampleConfigPath, configPath);
       } else {
         const initialConfig = {
-          channel_id: "あなたのFC2チャンネルID（数字）",
-          token: "FC2コメントAPIトークン",
+          channel_id: "",
+          token: "",
           serviceId: "",
           intervalMs: 2500
         };
         fs.writeFileSync(configPath, JSON.stringify(initialConfig, null, 2), 'utf8');
       }
-      console.info('[fc2-plugin] config.json を作成しました。設定を入力してください。');
-      return;
     }
 
-    const fetchFC2Comments = async (channelId, token, serviceId) => {
-      const url = `https://live.fc2.com/api/getChannelComment.php?channel_id=${encodeURIComponent(channelId)}&token=${encodeURIComponent(token)}&last_comment_index=${lastCommentIndex}`;
+    startPolling(dir);
+  },
 
-      const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error(`HTTPエラー: ${res.status}`);
-      }
+  // わんコメ Web API 通信ハンドラ (/api/plugins/com.fc2live.comment-sync)
+  async request(req) {
+    const configPath = path.join(currentDir, 'config.json');
 
-      const data = await res.json();
-
-      if (data.status !== 0) {
-        if (data.status !== lastErrorStatus) {
-          lastErrorStatus = data.status;
-          if (data.status === 11) {
-            console.warn(`[fc2-plugin] FC2 API ステータス 11: 認証エラー、または配信が開始されていない可能性があります。(channel_id: ${channelId})`);
-          } else {
-            console.warn(`[fc2-plugin] FC2 API エラーステータス: ${data.status}`);
-          }
-        }
-        return;
-      }
-
-      if (lastErrorStatus !== null) {
-        console.info('[fc2-plugin] FC2 APIへの接続が正常になりました。');
-        lastErrorStatus = null;
-      }
-
-      // 初回接続時: 直近15分以内のコメントを取り込む
-      if (!isInitialized) {
-        lastCommentIndex = typeof data.last_comment_index === 'number' ? data.last_comment_index : -1;
-        isInitialized = true;
-
-        const now = Date.now();
-        const recentThreshold = now - (15 * 60 * 1000);
-        const allComments = Array.isArray(data.comments) ? data.comments : [];
-        const recentComments = allComments.filter(c => c.timestamp && Number(c.timestamp) >= recentThreshold);
-
-        if (recentComments.length > 0) {
-          console.info(`[fc2-plugin] 初回接続成功！直近15分以内のコメント ${recentComments.length} 件を取り込みます (最新Index: ${lastCommentIndex})`);
-          await sendCommentsToOnecomme(recentComments, serviceId);
-        } else {
-          console.info(`[fc2-plugin] 初回接続成功！最新コメントIndex: ${lastCommentIndex} (過去コメント ${allComments.length} 件をスキップして新着待機)`);
-        }
-        return;
-      }
-
-      // 2回目以降の新着コメント処理
-      if (typeof data.last_comment_index === 'number' && data.last_comment_index > lastCommentIndex) {
-        lastCommentIndex = data.last_comment_index;
-      }
-
-      if (Array.isArray(data.comments) && data.comments.length > 0) {
-        await sendCommentsToOnecomme(data.comments, serviceId);
-      }
-    };
-
-    const poll = async () => {
-      if (isPolling) return;
-      isPolling = true;
-
+    // GET: 現在の設定と稼働ステータスを返却
+    if (req.method === 'GET') {
+      let config = { channel_id: '', token: '', serviceId: '', intervalMs: 2500 };
       try {
-        if (!fs.existsSync(configPath)) return;
-        const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-        const { channel_id, token, serviceId: configuredServiceId } = config;
+        if (fs.existsSync(configPath)) {
+          config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        }
+      } catch (_) {}
 
-        if (!channel_id || !token || channel_id.includes('ここに') || token.includes('ここに')) {
-          return;
+      return {
+        code: 200,
+        body: {
+          config,
+          status: statusState
+        }
+      };
+    }
+
+    // POST: 設定の更新 & 即時リスタート
+    if (req.method === 'POST') {
+      try {
+        const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+        let config = {};
+        if (fs.existsSync(configPath)) {
+          try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch (_) {}
         }
 
-        const serviceId = await resolveServiceId(configuredServiceId);
-        if (!serviceId) {
-          console.warn('[fc2-plugin] わんコメにFC2用の配信枠が見つかりません。わんコメで枠を追加（枠名を「FC2」にするか、URLに「live.fc2.com」を設定）してください。');
-          return;
-        }
+        if (body.channel_id !== undefined) config.channel_id = String(body.channel_id).trim();
+        if (body.token !== undefined) config.token = String(body.token).trim();
+        if (body.serviceId !== undefined) config.serviceId = String(body.serviceId).trim();
+        if (body.intervalMs !== undefined) config.intervalMs = Math.max(1000, Number(body.intervalMs) || 2500);
 
-        await fetchFC2Comments(channel_id, token, serviceId);
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+        console.info('[fc2-plugin] Web設定画面から設定が更新されました。再接続します...');
+
+        startPolling(currentDir);
+
+        return {
+          code: 200,
+          body: {
+            success: true,
+            config,
+            status: statusState
+          }
+        };
       } catch (err) {
-        console.error('[fc2-plugin] ポーリング中エラー:', err.message || err);
-      } finally {
-        isPolling = false;
+        return {
+          code: 400,
+          body: { success: false, error: err.message }
+        };
       }
-    };
+    }
 
-    let intervalMs = 2500;
-    try {
-      if (fs.existsSync(configPath)) {
-        const conf = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-        if (conf.intervalMs && conf.intervalMs >= 1000) {
-          intervalMs = conf.intervalMs;
-        }
-      }
-    } catch (_) {}
-
-    timer = setInterval(poll, intervalMs);
-    console.info(`[fc2-plugin] 監視ループを開始しました (${intervalMs}ms 間隔)`);
+    return { code: 405, body: { error: 'Method Not Allowed' } };
   },
 
   destroy() {
@@ -280,6 +398,8 @@ const plugin = {
     }
     isPolling = false;
     resetState();
+    statusState.status = 'idle';
+    statusState.message = '停止中';
     console.info('[fc2-plugin] プラグインを停止しました');
   }
 };
