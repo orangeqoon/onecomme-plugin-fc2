@@ -67,6 +67,16 @@ async function resolveServiceId(configuredId) {
     if (target) {
       resolvedServiceId = target.id;
       console.info(`[fc2-plugin] わんコメの枠 '${target.name}' (ID: ${target.id}) を自動検出しました！`);
+
+      // 接続スロットを消費しないよう、枠を常にOFF（enabled: false）に維持
+      if (target.enabled) {
+        fetch(`http://localhost:11180/api/services/${encodeURIComponent(target.id)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...target, enabled: false, url: '', meta: {} })
+        }).catch(() => {});
+      }
+
       return target.id;
     }
   } catch (err) {
@@ -75,16 +85,10 @@ async function resolveServiceId(configuredId) {
   return null;
 }
 
-// 枠がOFFになってビューアから消えるのを防ぐため、自動で有効化
+// 接続数制限を回避するため、わんコメ枠は常にOFF（未接続）のまま維持
 async function ensureServiceEnabled(serviceId) {
-  if (!serviceId) return;
-  try {
-    await fetch(`http://localhost:11180/api/services/${encodeURIComponent(serviceId)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: true, write: true })
-    });
-  } catch (_) {}
+  // 枠を勝手にON（enabled: true）にしない（上限エラー防止）
+  return;
 }
 
 // コメント送信処理
